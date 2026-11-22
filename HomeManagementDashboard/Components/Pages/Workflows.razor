@@ -1,0 +1,355 @@
+@page "/workflows"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject WorkflowEngineService WorkflowService
+@inject DeviceMonitorService MonitorService
+
+<PageTitle>Workflows — Device Monitor</PageTitle>
+
+<main class="page">
+    <header class="topbar">
+        <div>
+            <nav class="nav-tabs">
+                <a href="/" class="nav-tab">Devices</a>
+                <a href="/workflows" class="nav-tab active">Workflows</a>
+            </nav>
+            <h1>Workflow Engine</h1>
+            <p class="subtitle">
+                <strong>@EnabledCount</strong> of <strong>@_rules.Count</strong> active
+                <span> · Evaluates every 5s</span>
+            </p>
+        </div>
+
+        <div class="topbar-actions">
+            <button class="btn" @onclick="EvaluateNowAsync" disabled="@_isEvaluating">
+                @(_isEvaluating ? "Evaluating..." : "Evaluate All")
+            </button>
+        </div>
+    </header>
+
+    <section class="workflow-builder">
+        <h2>New Scenario</h2>
+        <form class="builder-grid" @onsubmit="CreateRule">
+            <div class="field field-full">
+                <label>Name</label>
+                <input type="text" @bind="_newName" placeholder="e.g. Restart Device2 when Device1 is hot" />
+            </div>
+
+            <div class="field">
+                <label>Trigger</label>
+                <select @bind="_newTriggerType">
+                    <option value="@WorkflowTriggerType.TemperatureAbove">Temperature Above (°C)</option>
+                    <option value="@WorkflowTriggerType.TemperatureBelow">Temperature Below (°C)</option>
+                    <option value="@WorkflowTriggerType.UptimeAbove">Uptime Above (s)</option>
+                    <option value="@WorkflowTriggerType.DeviceOnline">Device Comes Online</option>
+                    <option value="@WorkflowTriggerType.DeviceOffline">Device Goes Offline</option>
+                    <option value="@WorkflowTriggerType.OnPoll">Every Poll (5s)</option>
+                </select>
+            </div>
+
+            <div class="field">
+                <label>Trigger Device</label>
+                <select @bind="_newTriggerDeviceUrl">
+                    <option value="*">Any Device</option>
+                    @foreach (var d in _devices)
+                    {
+                        <option value="@d.EndpointUrl">@d.DisplayName (@d.EndpointUrl)</option>
+                    }
+                </select>
+            </div>
+
+            @if (NeedsTriggerValue(_newTriggerType))
+            {
+                <div class="field">
+                    <label>Trigger Value</label>
+                    <input type="number" step="0.1" @bind="_newTriggerValue" />
+                </div>
+            }
+
+            <div class="field">
+                <label>Condition</label>
+                <select @bind="_newConditionType">
+                    <option value="@WorkflowConditionType.None">None (Always)</option>
+                    <option value="@WorkflowConditionType.DeviceIsOnline">Device Is Online</option>
+                    <option value="@WorkflowConditionType.DeviceIsOffline">Device Is Offline</option>
+                    <option value="@WorkflowConditionType.TemperatureAbove">Device Temp Above (°C)</option>
+                    <option value="@WorkflowConditionType.TemperatureBelow">Device Temp Below (°C)</option>
+                    <option value="@WorkflowConditionType.OnlineCountAtLeast">Online Count &ge;</option>
+                    <option value="@WorkflowConditionType.OnlineCountBelow">Online Count &lt;</option>
+                </select>
+            </div>
+
+            @if (NeedsConditionDevice(_newConditionType))
+            {
+                <div class="field">
+                    <label>Condition Device</label>
+                    <select @bind="_newConditionDeviceUrl">
+                        @foreach (var d in _devices)
+                        {
+                            <option value="@d.EndpointUrl">@d.DisplayName (@d.EndpointUrl)</option>
+                        }
+                    </select>
+                </div>
+            }
+
+            @if (NeedsConditionValue(_newConditionType))
+            {
+                <div class="field">
+                    <label>Condition Value</label>
+                    <input type="number" step="0.1" @bind="_newConditionValue" />
+                </div>
+            }
+
+            <div class="field">
+                <label>Action Device</label>
+                <select @bind="_newActionDeviceUrl">
+                    @foreach (var d in _devices)
+                    {
+                        <option value="@d.EndpointUrl">@d.DisplayName (@d.EndpointUrl)</option>
+                    }
+                </select>
+            </div>
+
+            <div class="field">
+                <label>Action</label>
+                <select @bind="_newActionName">
+                    @foreach (var actionName in GetAvailableActions(_newActionDeviceUrl))
+                    {
+                        <option value="@actionName">@actionName</option>
+                    }
+                </select>
+            </div>
+
+            <div class="field field-submit">
+                <button type="submit" class="btn">Create Workflow</button>
+            </div>
+        </form>
+    </section>
+
+    <section class="rules-section">
+        @if (_rules.Count == 0)
+        {
+            <p class="empty">No workflows configured.</p>
+        }
+        else
+        {
+            @foreach (var rule in _rules)
+            {
+                <article class="rule-card">
+                    <div class="rule-head">
+                        <div class="device-id">
+                            <span class="dot @(rule.Enabled ? "online" : "offline")"></span>
+                            <div>
+                                <h2>@rule.Name</h2>
+                                <div class="meta">
+                                    Triggered @rule.TriggerCount time(s)
+                                    @if (rule.LastTriggeredUtc.HasValue)
+                                    {
+                                        <span> · Last: @rule.LastTriggeredUtc.Value.ToLocalTime().ToString("HH:mm:ss")</span>
+                                    }
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="device-head-right">
+                            <button class="btn-sm" @onclick="() => ToggleRule(rule.Id)">
+                                @(rule.Enabled ? "Disable" : "Enable")
+                            </button>
+                            <button class="btn-sm" @onclick="() => RunNowAsync(rule.Id)">Run</button>
+                            <button class="icon-btn" title="Delete" @onclick="() => DeleteRule(rule.Id)">×</button>
+                        </div>
+                    </div>
+
+                    <div class="rule-flow">
+                        <div><span class="label">When</span> @FormatTrigger(rule)</div>
+                        <div><span class="label">If</span> @FormatCondition(rule)</div>
+                        <div><span class="label">Then</span> @rule.ActionName on @GetDeviceLabel(rule.ActionDeviceUrl)</div>
+                    </div>
+
+                    @if (!string.IsNullOrWhiteSpace(rule.LastResult))
+                    {
+                        <div class="rule-result">@rule.LastResult</div>
+                    }
+                </article>
+            }
+        }
+    </section>
+
+    @if (_logs.Count > 0)
+    {
+        <section class="logs-section">
+            <div class="output-head">
+                <span>Execution Log</span>
+                <button class="link-btn" @onclick="ClearLogs">Clear</button>
+            </div>
+            <div class="log-list">
+                @foreach (var entry in _logs)
+                {
+                    <div class="log-row">
+                        <span class="log-time">@entry.TimestampUtc.ToLocalTime().ToString("HH:mm:ss")</span>
+                        <span class="log-rule">@entry.RuleName</span>
+                        <span class="log-msg">@entry.Message</span>
+                    </div>
+                }
+            </div>
+        </section>
+    }
+</main>
+
+@code {
+    private IReadOnlyList<WorkflowRule> _rules = [];
+    private IReadOnlyList<WorkflowLogEntry> _logs = [];
+    private IReadOnlyList<MonitoredDeviceState> _devices = [];
+    private bool _isEvaluating;
+
+    private string _newName = string.Empty;
+    private WorkflowTriggerType _newTriggerType = WorkflowTriggerType.TemperatureAbove;
+    private string _newTriggerDeviceUrl = "*";
+    private double? _newTriggerValue = 45.0;
+    private WorkflowConditionType _newConditionType = WorkflowConditionType.None;
+    private string? _newConditionDeviceUrl;
+    private double? _newConditionValue = 1;
+    private string _newActionDeviceUrl = string.Empty;
+    private string _newActionName = "INFO";
+
+    private int EnabledCount => _rules.Count(r => r.Enabled);
+
+    protected override void OnInitialized()
+    {
+        _devices = MonitorService.GetDevices();
+        _newConditionDeviceUrl = _devices.FirstOrDefault()?.EndpointUrl;
+        _newActionDeviceUrl = _devices.FirstOrDefault()?.EndpointUrl ?? "http://localhost:1235";
+
+        RefreshLists();
+        WorkflowService.OnStateChanged += HandleServiceStateChanged;
+    }
+
+    private void HandleServiceStateChanged()
+    {
+        _ = InvokeAsync(() =>
+        {
+            RefreshLists();
+            StateHasChanged();
+        });
+    }
+
+    private void RefreshLists()
+    {
+        _rules = WorkflowService.GetRules();
+        _logs = WorkflowService.GetLogs();
+        _devices = MonitorService.GetDevices();
+    }
+
+    private void CreateRule()
+    {
+        var name = string.IsNullOrWhiteSpace(_newName)
+            ? $"{_newTriggerType} -> {_newActionName}"
+            : _newName.Trim();
+
+        WorkflowService.AddRule(new WorkflowRule
+        {
+            Name = name,
+            Enabled = true,
+            TriggerType = _newTriggerType,
+            TriggerDeviceUrl = _newTriggerDeviceUrl,
+            TriggerValue = NeedsTriggerValue(_newTriggerType) ? _newTriggerValue : null,
+            ConditionType = _newConditionType,
+            ConditionDeviceUrl = NeedsConditionDevice(_newConditionType) ? _newConditionDeviceUrl : null,
+            ConditionValue = NeedsConditionValue(_newConditionType) ? _newConditionValue : null,
+            ActionDeviceUrl = _newActionDeviceUrl,
+            ActionName = _newActionName
+        });
+
+        _newName = string.Empty;
+        RefreshLists();
+    }
+
+    private void ToggleRule(Guid id) => WorkflowService.ToggleRule(id);
+
+    private void DeleteRule(Guid id) => WorkflowService.DeleteRule(id);
+
+    private async Task RunNowAsync(Guid id)
+    {
+        await WorkflowService.RunRuleNowAsync(id);
+        RefreshLists();
+    }
+
+    private async Task EvaluateNowAsync()
+    {
+        _isEvaluating = true;
+        try
+        {
+            await WorkflowService.EvaluateAllAsync();
+            RefreshLists();
+        }
+        finally
+        {
+            _isEvaluating = false;
+        }
+    }
+
+    private void ClearLogs() => WorkflowService.ClearLogs();
+
+    private IEnumerable<string> GetAvailableActions(string deviceUrl)
+    {
+        var device = _devices.FirstOrDefault(d =>
+            string.Equals(d.EndpointUrl, deviceUrl, StringComparison.OrdinalIgnoreCase));
+
+        if (device?.Config?.Actions is { Count: > 0 } actions)
+        {
+            return actions.Select(a => a.Action);
+        }
+
+        return ["INFO", "RESTART", "SHUTDOWN"];
+    }
+
+    private string GetDeviceLabel(string url)
+    {
+        if (url == "*")
+        {
+            return "Any Device";
+        }
+
+        var d = _devices.FirstOrDefault(x => string.Equals(x.EndpointUrl, url, StringComparison.OrdinalIgnoreCase));
+        return d is not null ? d.DisplayName : url;
+    }
+
+    private string FormatTrigger(WorkflowRule rule) => rule.TriggerType switch
+    {
+        WorkflowTriggerType.DeviceOnline => $"{GetDeviceLabel(rule.TriggerDeviceUrl)} comes online",
+        WorkflowTriggerType.DeviceOffline => $"{GetDeviceLabel(rule.TriggerDeviceUrl)} goes offline",
+        WorkflowTriggerType.TemperatureAbove => $"{GetDeviceLabel(rule.TriggerDeviceUrl)} temp > {rule.TriggerValue} °C",
+        WorkflowTriggerType.TemperatureBelow => $"{GetDeviceLabel(rule.TriggerDeviceUrl)} temp < {rule.TriggerValue} °C",
+        WorkflowTriggerType.UptimeAbove => $"{GetDeviceLabel(rule.TriggerDeviceUrl)} uptime > {rule.TriggerValue}s",
+        WorkflowTriggerType.OnPoll => "Every poll cycle (5s)",
+        _ => rule.TriggerType.ToString()
+    };
+
+    private string FormatCondition(WorkflowRule rule) => rule.ConditionType switch
+    {
+        WorkflowConditionType.None => "Always",
+        WorkflowConditionType.DeviceIsOnline => $"{GetDeviceLabel(rule.ConditionDeviceUrl ?? "")} is online",
+        WorkflowConditionType.DeviceIsOffline => $"{GetDeviceLabel(rule.ConditionDeviceUrl ?? "")} is offline",
+        WorkflowConditionType.TemperatureAbove => $"{GetDeviceLabel(rule.ConditionDeviceUrl ?? "")} temp > {rule.ConditionValue} °C",
+        WorkflowConditionType.TemperatureBelow => $"{GetDeviceLabel(rule.ConditionDeviceUrl ?? "")} temp < {rule.ConditionValue} °C",
+        WorkflowConditionType.OnlineCountAtLeast => $"Online devices >= {rule.ConditionValue}",
+        WorkflowConditionType.OnlineCountBelow => $"Online devices < {rule.ConditionValue}",
+        _ => rule.ConditionType.ToString()
+    };
+
+    private static bool NeedsTriggerValue(WorkflowTriggerType t) =>
+        t is WorkflowTriggerType.TemperatureAbove or WorkflowTriggerType.TemperatureBelow or WorkflowTriggerType.UptimeAbove;
+
+    private static bool NeedsConditionDevice(WorkflowConditionType c) =>
+        c is WorkflowConditionType.DeviceIsOnline or WorkflowConditionType.DeviceIsOffline
+            or WorkflowConditionType.TemperatureAbove or WorkflowConditionType.TemperatureBelow;
+
+    private static bool NeedsConditionValue(WorkflowConditionType c) =>
+        c is WorkflowConditionType.TemperatureAbove or WorkflowConditionType.TemperatureBelow
+            or WorkflowConditionType.OnlineCountAtLeast or WorkflowConditionType.OnlineCountBelow;
+
+    public void Dispose()
+    {
+        WorkflowService.OnStateChanged -= HandleServiceStateChanged;
+    }
+}

@@ -1,0 +1,346 @@
+@page "/"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject DeviceMonitorService MonitorService
+@using System.Globalization
+
+<PageTitle>Device Monitor</PageTitle>
+
+<main class="page">
+    <header class="topbar">
+        <div>
+            <nav class="nav-tabs">
+                <a href="/" class="nav-tab active">Devices</a>
+                <a href="/workflows" class="nav-tab">Workflows</a>
+            </nav>
+            <h1>Device Monitor</h1>
+            <p class="subtitle">
+                <strong>@OnlineCount</strong> of <strong>@TotalCount</strong> online
+                @if (AverageTemperatureDisplay is not null)
+                {
+                    <span> · Avg @AverageTemperatureDisplay</span>
+                }
+                @if (_lastRefreshLocal.HasValue)
+                {
+                    <span> · Updated @_lastRefreshLocal.Value.ToString("HH:mm:ss")</span>
+                }
+            </p>
+        </div>
+
+        <div class="topbar-actions">
+            <label class="toggle">
+                <input type="checkbox" @bind="AutoRefreshEnabled" @bind:after="OnAutoRefreshChanged" />
+                <span>Auto (5s)</span>
+            </label>
+
+            <button class="btn" @onclick="RefreshAllAsync" disabled="@_isRefreshing">
+                @(_isRefreshing ? "Refreshing..." : "Refresh")
+            </button>
+        </div>
+    </header>
+
+    <form class="add-row" @onsubmit="AddDeviceAsync">
+        <input type="text"
+               placeholder="Add device URL (e.g. http://localhost:1235)"
+               @bind="_newEndpointUrl"
+               @bind:event="oninput" />
+        <button type="submit" class="btn">Add</button>
+    </form>
+
+    @if (!string.IsNullOrWhiteSpace(_feedbackMessage))
+    {
+        <p class="feedback">@_feedbackMessage</p>
+    }
+
+    <section class="device-list">
+        @foreach (var device in _devices)
+        {
+            <article class="device-card">
+                <div class="device-head">
+                    <div class="device-id">
+                        <span class="dot @(device.IsOnline ? "online" : "offline")" title="@(device.IsOnline ? "Online" : "Offline")"></span>
+                        <div>
+                            <h2>@device.DisplayName</h2>
+                            <div class="meta">
+                                <a href="@($"{device.EndpointUrl}/info")" target="_blank" rel="noopener">@device.EndpointUrl</a>
+                                @if (device.IsOnline && !string.IsNullOrWhiteSpace(device.ReportedAddress))
+                                {
+                                    <span> · @device.ReportedAddress</span>
+                                }
+                                @if (device.ResponseTimeMs.HasValue)
+                                {
+                                    <span> · @device.ResponseTimeMs ms</span>
+                                }
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="device-head-right">
+                        <span class="status @(device.IsOnline ? "online" : "offline")">
+                            @(device.IsOnline ? "Online" : "Offline")
+                        </span>
+                        <button class="icon-btn" title="Refresh" @onclick="() => RefreshSingleAsync(device)" disabled="@device.IsChecking">↻</button>
+                        <button class="icon-btn" title="Remove" @onclick="() => RemoveDevice(device.EndpointUrl)">×</button>
+                    </div>
+                </div>
+
+                @if (device.IsOnline && device.Info is not null)
+                {
+                    <div class="stats">
+                        <div>
+                            <span class="label">Uptime</span>
+                            <span class="value">@FormatUptime(device.Info.Metrics)</span>
+                        </div>
+                        <div>
+                            <span class="label">Temperature</span>
+                            <span class="value">@FormatTemperature(device.Info.Metrics)</span>
+                        </div>
+                        <div>
+                            <span class="label">Checked</span>
+                            <span class="value">@(device.LastCheckedUtc?.ToLocalTime().ToString("HH:mm:ss") ?? "—")</span>
+                        </div>
+                    </div>
+
+                    @if (device.Config?.Actions is { Count: > 0 } actions)
+                    {
+                        <div class="actions">
+                            @foreach (var action in actions)
+                            {
+                                <button class="btn-sm @GetActionCssClass(action.Action)"
+                                        @onclick="() => RunActionAsync(device, action)"
+                                        disabled="@_runningAction">
+                                    @action.Action
+                                </button>
+                            }
+                        </div>
+                    }
+                }
+                else
+                {
+                    <p class="error-text">@(device.LastError ?? "Device unreachable.")</p>
+                }
+
+                @if (!string.IsNullOrWhiteSpace(device.LastActionResponse))
+                {
+                    <div class="output">
+                        <div class="output-head">
+                            <span>Output (@device.LastActionTimeUtc?.ToLocalTime().ToString("HH:mm:ss"))</span>
+                            <button class="link-btn" @onclick="() => device.LastActionResponse = null">Clear</button>
+                        </div>
+                        <pre>@device.LastActionResponse</pre>
+                    </div>
+                }
+            </article>
+        }
+    </section>
+</main>
+
+@code {
+    private IReadOnlyList<MonitoredDeviceState> _devices = [];
+    private bool _isRefreshing;
+    private bool _runningAction;
+    private bool AutoRefreshEnabled { get; set; } = true;
+    private DateTime? _lastRefreshLocal;
+    private string _newEndpointUrl = string.Empty;
+    private string? _feedbackMessage;
+    private PeriodicTimer? _timer;
+    private CancellationTokenSource? _timerCts;
+
+    private int TotalCount => _devices.Count;
+    private int OnlineCount => _devices.Count(d => d.IsOnline);
+
+    private string? AverageTemperatureDisplay
+    {
+        get
+        {
+            var temps = new List<double>();
+            foreach (var d in _devices.Where(x => x.IsOnline && x.Info is not null))
+            {
+                if (d.Info!.Metrics.TryGetValue("Temperature", out var raw) &&
+                    double.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var val))
+                {
+                    temps.Add(val);
+                }
+            }
+
+            return temps.Count > 0 ? $"{temps.Average():F1} °C" : null;
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        _devices = MonitorService.GetDevices();
+        await RefreshAllAsync();
+        StartAutoRefreshLoop();
+    }
+
+    private void StartAutoRefreshLoop()
+    {
+        StopAutoRefreshLoop();
+        if (!AutoRefreshEnabled)
+        {
+            return;
+        }
+
+        _timerCts = new CancellationTokenSource();
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        _ = RunTimerAsync(_timer, _timerCts.Token);
+    }
+
+    private async Task RunTimerAsync(PeriodicTimer timer, CancellationToken token)
+    {
+        try
+        {
+            while (await timer.WaitForNextTickAsync(token))
+            {
+                if (!_isRefreshing && AutoRefreshEnabled)
+                {
+                    await InvokeAsync(async () =>
+                    {
+                        await RefreshAllAsync();
+                        StateHasChanged();
+                    });
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private void OnAutoRefreshChanged()
+    {
+        if (AutoRefreshEnabled)
+        {
+            StartAutoRefreshLoop();
+        }
+        else
+        {
+            StopAutoRefreshLoop();
+        }
+    }
+
+    private void StopAutoRefreshLoop()
+    {
+        _timerCts?.Cancel();
+        _timerCts?.Dispose();
+        _timerCts = null;
+        _timer?.Dispose();
+        _timer = null;
+    }
+
+    private async Task RefreshAllAsync()
+    {
+        if (_isRefreshing)
+        {
+            return;
+        }
+
+        _isRefreshing = true;
+        try
+        {
+            await MonitorService.RefreshAllAsync();
+            _devices = MonitorService.GetDevices();
+            _lastRefreshLocal = DateTime.Now;
+        }
+        finally
+        {
+            _isRefreshing = false;
+        }
+    }
+
+    private async Task RefreshSingleAsync(MonitoredDeviceState device)
+    {
+        await MonitorService.RefreshDeviceAsync(device);
+        _lastRefreshLocal = DateTime.Now;
+    }
+
+    private async Task AddDeviceAsync()
+    {
+        _feedbackMessage = null;
+        if (string.IsNullOrWhiteSpace(_newEndpointUrl))
+        {
+            _feedbackMessage = "Enter a valid device URL (e.g. http://localhost:1235).";
+            return;
+        }
+
+        if (MonitorService.AddDeviceEndpoint(_newEndpointUrl))
+        {
+            _newEndpointUrl = string.Empty;
+            _devices = MonitorService.GetDevices();
+            await RefreshAllAsync();
+        }
+        else
+        {
+            _feedbackMessage = "Endpoint already exists or is invalid.";
+        }
+    }
+
+    private void RemoveDevice(string endpointUrl)
+    {
+        MonitorService.RemoveDeviceEndpoint(endpointUrl);
+        _devices = MonitorService.GetDevices();
+    }
+
+    private async Task RunActionAsync(MonitoredDeviceState device, DeviceAction action)
+    {
+        _runningAction = true;
+        try
+        {
+            await MonitorService.ExecuteActionAsync(device, action);
+        }
+        finally
+        {
+            _runningAction = false;
+        }
+    }
+
+    private static string FormatUptime(Dictionary<string, string> metrics)
+    {
+        if (!metrics.TryGetValue("UptimeSeconds", out var raw) ||
+            !long.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var seconds) ||
+            seconds <= 0)
+        {
+            return "0s";
+        }
+
+        var ts = TimeSpan.FromSeconds(seconds);
+        if (ts.TotalDays >= 1)
+        {
+            return $"{(int)ts.TotalDays}d {ts.Hours}h {ts.Minutes}m";
+        }
+        if (ts.TotalHours >= 1)
+        {
+            return $"{(int)ts.TotalHours}h {ts.Minutes}m {ts.Seconds}s";
+        }
+        return $"{ts.Minutes}m {ts.Seconds}s";
+    }
+
+    private static string FormatTemperature(Dictionary<string, string> metrics)
+    {
+        if (metrics.TryGetValue("Temperature", out var raw) &&
+            double.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var temp))
+        {
+            return $"{temp:F1} °C";
+        }
+        return "—";
+    }
+
+    private static string GetActionCssClass(string actionName)
+    {
+        if (actionName.Equals("SHUTDOWN", StringComparison.OrdinalIgnoreCase))
+        {
+            return "danger";
+        }
+        if (actionName.Equals("RESTART", StringComparison.OrdinalIgnoreCase))
+        {
+            return "warn";
+        }
+        return string.Empty;
+    }
+
+    public void Dispose()
+    {
+        StopAutoRefreshLoop();
+    }
+}
