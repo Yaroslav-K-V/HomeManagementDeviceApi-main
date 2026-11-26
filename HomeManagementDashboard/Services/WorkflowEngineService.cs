@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Text.Json;
 using HomeManagement.Shared;
+using HomeManagementDashboard.Data;
+using Microsoft.EntityFrameworkCore;
 
 namespace HomeManagementDashboard.Services;
 
@@ -56,21 +58,25 @@ public record WorkflowLogEntry(DateTime TimestampUtc, string RuleName, string Me
 public class WorkflowEngineService : BackgroundService
 {
     private readonly DeviceMonitorService _monitorService;
-    private readonly string _storagePath;
+    private readonly IDbContextFactory<AppDbContext> _dbFactory;
+    private readonly string _legacyJsonPath;
     private readonly List<WorkflowRule> _rules = [];
     private readonly List<WorkflowLogEntry> _logs = [];
     private readonly Dictionary<string, bool> _previousOnlineStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lock _lock = new();
     private static readonly TimeSpan RuleCooldown = TimeSpan.FromSeconds(30);
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public event Action? OnStateChanged;
 
-    public WorkflowEngineService(DeviceMonitorService monitorService, IHostEnvironment env)
+    public WorkflowEngineService(
+        DeviceMonitorService monitorService,
+        IDbContextFactory<AppDbContext> dbFactory,
+        IHostEnvironment env)
     {
         _monitorService = monitorService;
-        _storagePath = Path.Combine(env.ContentRootPath, "workflows.json");
-        LoadRules();
+        _dbFactory = dbFactory;
+        _legacyJsonPath = Path.Combine(env.ContentRootPath, "workflows.json");
+        LoadFromDatabase();
     }
 
     public IReadOnlyList<WorkflowRule> GetRules()
@@ -94,35 +100,61 @@ public class WorkflowEngineService : BackgroundService
         lock (_lock)
         {
             _rules.Add(rule);
-            SaveRulesLocked();
         }
+
+        using var db = _dbFactory.CreateDbContext();
+        db.WorkflowRules.Add(ToEntity(rule));
+        db.SaveChanges();
+
         OnStateChanged?.Invoke();
     }
 
     public void ToggleRule(Guid id)
     {
+        WorkflowRule? updated = null;
         lock (_lock)
         {
             var rule = _rules.FirstOrDefault(r => r.Id == id);
             if (rule is not null)
             {
                 rule.Enabled = !rule.Enabled;
-                SaveRulesLocked();
+                updated = rule;
             }
         }
+
+        if (updated is not null)
+        {
+            using var db = _dbFactory.CreateDbContext();
+            var entity = db.WorkflowRules.FirstOrDefault(r => r.Id == id);
+            if (entity is not null)
+            {
+                entity.Enabled = updated.Enabled;
+                db.SaveChanges();
+            }
+        }
+
         OnStateChanged?.Invoke();
     }
 
     public void DeleteRule(Guid id)
     {
+        bool removed;
         lock (_lock)
         {
-            var removed = _rules.RemoveAll(r => r.Id == id);
-            if (removed > 0)
+            removed = _rules.RemoveAll(r => r.Id == id) > 0;
+        }
+
+        if (removed)
+        {
+            using var db = _dbFactory.CreateDbContext();
+            var entity = db.WorkflowRules.FirstOrDefault(r => r.Id == id);
+            if (entity is not null)
             {
-                SaveRulesLocked();
+                db.WorkflowRules.Remove(entity);
+                db.SaveChanges();
             }
         }
+
         OnStateChanged?.Invoke();
     }
 
@@ -132,6 +164,10 @@ public class WorkflowEngineService : BackgroundService
         {
             _logs.Clear();
         }
+
+        using var db = _dbFactory.CreateDbContext();
+        db.WorkflowLogs.ExecuteDelete();
+
         OnStateChanged?.Invoke();
     }
 
@@ -332,19 +368,45 @@ public class WorkflowEngineService : BackgroundService
 
     private void RecordResult(WorkflowRule rule, string message, bool success)
     {
+        var now = DateTime.UtcNow;
         lock (_lock)
         {
-            rule.LastTriggeredUtc = DateTime.UtcNow;
+            rule.LastTriggeredUtc = now;
             rule.TriggerCount++;
             rule.LastResult = message;
 
-            _logs.Insert(0, new WorkflowLogEntry(DateTime.UtcNow, rule.Name, message, success));
+            _logs.Insert(0, new WorkflowLogEntry(now, rule.Name, message, success));
             if (_logs.Count > 50)
             {
                 _logs.RemoveRange(50, _logs.Count - 50);
             }
+        }
 
-            SaveRulesLocked();
+        try
+        {
+            using var db = _dbFactory.CreateDbContext();
+            var entity = db.WorkflowRules.FirstOrDefault(r => r.Id == rule.Id);
+            if (entity is not null)
+            {
+                entity.LastTriggeredUtc = rule.LastTriggeredUtc;
+                entity.TriggerCount = rule.TriggerCount;
+                entity.LastResult = rule.LastResult;
+            }
+
+            db.WorkflowLogs.Add(new WorkflowLogEntity
+            {
+                WorkflowRuleId = rule.Id,
+                RuleName = rule.Name,
+                Message = message,
+                Success = success,
+                TimestampUtc = now
+            });
+
+            db.SaveChanges();
+        }
+        catch
+        {
+            // Keep background workflow loop resilient on transient SQLite lock contention.
         }
     }
 
@@ -355,54 +417,108 @@ public class WorkflowEngineService : BackgroundService
                double.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out value);
     }
 
-    private void LoadRules()
+    private void LoadFromDatabase()
     {
-        lock (_lock)
+        using var db = _dbFactory.CreateDbContext();
+        db.EnsureSchema();
+
+        var ruleEntities = db.WorkflowRules.AsNoTracking().ToList();
+        if (ruleEntities.Count == 0)
         {
-            if (File.Exists(_storagePath))
+            var seeded = TryLoadLegacyRules() ??
+            [
+                new WorkflowRule
+                {
+                    Name = "High Temp Check",
+                    Enabled = false,
+                    TriggerType = WorkflowTriggerType.TemperatureAbove,
+                    TriggerDeviceUrl = "http://localhost:1235",
+                    TriggerValue = 45.0,
+                    ConditionType = WorkflowConditionType.OnlineCountAtLeast,
+                    ConditionValue = 1,
+                    ActionDeviceUrl = "http://localhost:1235",
+                    ActionName = "INFO"
+                }
+            ];
+
+            foreach (var r in seeded)
             {
-                try
-                {
-                    var json = File.ReadAllText(_storagePath);
-                    var loaded = JsonSerializer.Deserialize<List<WorkflowRule>>(json);
-                    if (loaded is not null)
-                    {
-                        _rules.AddRange(loaded);
-                        return;
-                    }
-                }
-                catch
-                {
-                    // Fall back to default seed rule if file is unreadable.
-                }
+                var entity = ToEntity(r);
+                db.WorkflowRules.Add(entity);
+                ruleEntities.Add(entity);
             }
 
-            _rules.Add(new WorkflowRule
-            {
-                Name = "High Temp Check",
-                Enabled = false,
-                TriggerType = WorkflowTriggerType.TemperatureAbove,
-                TriggerDeviceUrl = "http://localhost:1235",
-                TriggerValue = 45.0,
-                ConditionType = WorkflowConditionType.OnlineCountAtLeast,
-                ConditionValue = 1,
-                ActionDeviceUrl = "http://localhost:1235",
-                ActionName = "INFO"
-            });
-            SaveRulesLocked();
+            db.SaveChanges();
+        }
+
+        var logEntities = db.WorkflowLogs
+            .OrderByDescending(l => l.TimestampUtc)
+            .Take(50)
+            .AsNoTracking()
+            .ToList();
+
+        lock (_lock)
+        {
+            _rules.Clear();
+            _rules.AddRange(ruleEntities.Select(ToModel));
+
+            _logs.Clear();
+            _logs.AddRange(logEntities.Select(l => new WorkflowLogEntry(l.TimestampUtc, l.RuleName, l.Message, l.Success)));
         }
     }
 
-    private void SaveRulesLocked()
+    private List<WorkflowRule>? TryLoadLegacyRules()
     {
+        if (!File.Exists(_legacyJsonPath))
+        {
+            return null;
+        }
+
         try
         {
-            var json = JsonSerializer.Serialize(_rules, JsonOptions);
-            File.WriteAllText(_storagePath, json);
+            var json = File.ReadAllText(_legacyJsonPath);
+            var loaded = JsonSerializer.Deserialize<List<WorkflowRule>>(json);
+            return loaded is { Count: > 0 } ? loaded : null;
         }
         catch
         {
-            // Ignore disk write issues in restricted environments.
+            return null;
         }
     }
+
+    private static WorkflowRuleEntity ToEntity(WorkflowRule rule) => new()
+    {
+        Id = rule.Id,
+        Name = rule.Name,
+        Enabled = rule.Enabled,
+        TriggerType = (int)rule.TriggerType,
+        TriggerDeviceUrl = rule.TriggerDeviceUrl,
+        TriggerValue = rule.TriggerValue,
+        ConditionType = (int)rule.ConditionType,
+        ConditionDeviceUrl = rule.ConditionDeviceUrl,
+        ConditionValue = rule.ConditionValue,
+        ActionDeviceUrl = rule.ActionDeviceUrl,
+        ActionName = rule.ActionName,
+        LastTriggeredUtc = rule.LastTriggeredUtc,
+        TriggerCount = rule.TriggerCount,
+        LastResult = rule.LastResult
+    };
+
+    private static WorkflowRule ToModel(WorkflowRuleEntity entity) => new()
+    {
+        Id = entity.Id,
+        Name = entity.Name,
+        Enabled = entity.Enabled,
+        TriggerType = (WorkflowTriggerType)entity.TriggerType,
+        TriggerDeviceUrl = entity.TriggerDeviceUrl,
+        TriggerValue = entity.TriggerValue,
+        ConditionType = (WorkflowConditionType)entity.ConditionType,
+        ConditionDeviceUrl = entity.ConditionDeviceUrl,
+        ConditionValue = entity.ConditionValue,
+        ActionDeviceUrl = entity.ActionDeviceUrl,
+        ActionName = entity.ActionName,
+        LastTriggeredUtc = entity.LastTriggeredUtc,
+        TriggerCount = entity.TriggerCount,
+        LastResult = entity.LastResult
+    };
 }

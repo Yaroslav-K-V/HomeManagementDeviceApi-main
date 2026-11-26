@@ -12,6 +12,7 @@
             <nav class="nav-tabs">
                 <a href="/" class="nav-tab active">Devices</a>
                 <a href="/workflows" class="nav-tab">Workflows</a>
+                <a href="/swagger" target="_blank" rel="noopener" class="nav-tab">API Docs</a>
             </nav>
             <h1>Device Monitor</h1>
             <p class="subtitle">
@@ -32,6 +33,10 @@
                 <input type="checkbox" @bind="AutoRefreshEnabled" @bind:after="OnAutoRefreshChanged" />
                 <span>Auto (5s)</span>
             </label>
+
+            <button class="btn" @onclick="DiscoverDevicesAsync" disabled="@_isDiscovering">
+                @(_isDiscovering ? "Discovering..." : "Discover")
+            </button>
 
             <button class="btn" @onclick="RefreshAllAsync" disabled="@_isRefreshing">
                 @(_isRefreshing ? "Refreshing..." : "Refresh")
@@ -167,11 +172,19 @@
         }
     }
 
-    protected override async Task OnInitializedAsync()
+    protected override void OnInitialized()
     {
         _devices = MonitorService.GetDevices();
-        await RefreshAllAsync();
         StartAutoRefreshLoop();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await RefreshAllAsync();
+            StateHasChanged();
+        }
     }
 
     private void StartAutoRefreshLoop()
@@ -227,6 +240,32 @@
         _timerCts = null;
         _timer?.Dispose();
         _timer = null;
+    }
+
+    private bool _isDiscovering;
+
+    private async Task DiscoverDevicesAsync()
+    {
+        if (_isDiscovering)
+        {
+            return;
+        }
+
+        _isDiscovering = true;
+        _feedbackMessage = null;
+        try
+        {
+            var result = await MonitorService.DiscoverDevicesAsync();
+            _devices = MonitorService.GetDevices();
+            _lastRefreshLocal = DateTime.Now;
+            _feedbackMessage = result.DiscoveredDevices.Count > 0
+                ? $"Discovered {result.DiscoveredDevices.Count} new virtual device(s) across {result.ProbedCount} ports."
+                : $"Probed {result.ProbedCount} ports; no new virtual devices found.";
+        }
+        finally
+        {
+            _isDiscovering = false;
+        }
     }
 
     private async Task RefreshAllAsync()

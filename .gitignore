@@ -35,3 +35,8 @@ artifacts/
 *.nuget.props
 *.nuget.targets
 workflows.json
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
