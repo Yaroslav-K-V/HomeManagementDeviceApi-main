@@ -6,6 +6,26 @@ A full-stack **.NET 10** IoT / edge device management solution consisting of a v
 
 ---
 
+## Demo & Screenshots
+
+### Live Walkthrough
+
+![Home Management Demo](docs/media/demo.gif)
+
+### Device Monitor Dashboard
+
+![Device Monitor Dashboard](docs/media/dashboard.png)
+
+### Workflow Engine
+
+![Workflow Engine](docs/media/workflows.png)
+
+### Swagger / OpenAPI Docs
+
+![Swagger API Docs](docs/media/swagger.png)
+
+---
+
 ## Architecture
 
 1. **`HomeManagementDeviceApi`** — Virtual smart device simulator exposing `/info`, `/config`, `/command`, `/shutdown`, and `/restart` endpoints. Multiple instances can be run concurrently using launch profiles (`Device1`–`Device4`).
